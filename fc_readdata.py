@@ -47,11 +47,14 @@ class ODriveMonitor:
 
     def background_monitor(self):
         """后台线程：持续打印电流，不再原地刷新"""
+        count = 0;
         while self.running:
             if self.monitoring:
                 # 获取数据
                 i_raw = self.send_and_receive("r axis0.motor.current_control.Iq_measured")
-                v_raw = self.send_and_receive("r vbus_voltage")
+                if count % 5 == 0 :
+                    v_raw = self.send_and_receive("r vbus_voltage") # 电流读取10次，电压读取一次
+                count += 1
                 # 计算相对时间（标定时横坐标更清晰）
                 relative_time = time.time() - self.start_time
 
@@ -67,7 +70,7 @@ class ODriveMonitor:
                     print(f"[DATA] T:{relative_time:>6.2f}s | I:{i_q:>7.3f}A | P:{abs(i_q * v_bus):>6.2f}W")
                 except Exception as e:
                     print("解析失败:", repr(i_raw), repr(v_raw), e)
-            time.sleep(0.01)  # 稍微降低频率，防止指令堆积
+            time.sleep(0.001)  # 稍微降低频率，防止指令堆积，预期采样频率并非这里的时间，ASCII 协议的轮询机制耗时
 
     def stop(self):
         """退出时安全关闭文件"""
