@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- 实验数据与采样文件 ---
+*.csv
+*.txt
+/data/raw/
+/data/processed/
