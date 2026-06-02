@@ -16,7 +16,7 @@ with open(filename, 'w', newline='') as f:
     writer.writerow(["time", "iq", "vbus"])
 
 # --- 配置区 ---
-PORT = 'COM10'
+PORT = 'COM9'
 BAUD = 115200
 RATIO = 16
 
