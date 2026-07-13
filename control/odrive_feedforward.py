@@ -46,6 +46,7 @@ def main():
     print(f"电机当前位置: {start_pos:.3f} 圈，准备开始运动...")
     print(f"共转 {NUM_TURNS} 圈，每圈: 前半圈飞速（{V_FAST} turns/s），后半圈龟速（{V_SLOW} turns/s）")
 
+    print_counter = 0
     try:
         while current_pos < target_end:
             # 计算当前运动的相对进度（走了多少圈）
@@ -72,9 +73,23 @@ def main():
             # 兼容老版本固件(v3.6)，使用 input_vel 充当速度前馈
             axis.controller.input_vel = vel_ff
 
+            # ---- 【核心新增功能】读取并打印实际速度 ----
+            print_counter += 1
+            if print_counter >= 10:  # 每 100ms (10次循环) 打印一次数据
+                print_counter = 0
+                # 从编码器寄存器读取电机当前的实际预估速度
+                actual_vel = axis.encoder.vel_estimate
+                actual_pos = axis.encoder.pos_estimate
+
+                # \r 表示让光标回到行首，end="" 表示不换行，实现原地刷新效果
+                print(
+                    f"\r[运行中] 目标位置: {current_pos:6.2f} 圈 | 实际位置: {actual_pos:6.2f} 圈 | 前馈速度: {vel_ff:4.1f} | 实际速度: {actual_vel:6.2f} turns/s",
+                    end="", flush=True)
+
             # 维持高频循环的时间间隔
             time.sleep(dt)
-
+        # 运动完成后，给终端换个行，打印最终状态
+        print("\n----------------──────────────────")
         print(f"运动完成！当前电机最终位置: {axis.encoder.pos_estimate:.3f} 圈")
 
     except KeyboardInterrupt:
