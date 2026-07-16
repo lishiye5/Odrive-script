@@ -12,8 +12,12 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+try:
+    from serial.tools import list_ports
+except ImportError:
+    list_ports = None
 
-PORT = "COM6"
+DEFAULT_PORT = "COM6"
 BAUD = 115200
 
 MAV_CMD_DO_SET_ACTUATOR = 187
@@ -95,11 +99,14 @@ class ServoControlApp:
         self.stop_event = threading.Event()
         self.event_queue = queue.Queue()
         self.connected = False
+        self.connection_id = 0
+        self.heartbeat_started = False
         self.latest_heartbeat = None
         self.rc_arm_value = None
         self.last_ack = "无"
 
         self.rows = []
+        self.port_var = tk.StringVar(value=DEFAULT_PORT)
         self.status_var = tk.StringVar(value="未连接")
         self.arm_var = tk.StringVar(value="解锁状态: 未知")
         self.ack_var = tk.StringVar(value="命令回执: 无")
@@ -120,12 +127,25 @@ class ServoControlApp:
         intro_frame.pack(fill="x", padx=12, pady=(12, 8))
         ttk.Label(intro_frame, text=intro, justify="left").pack(anchor="w", padx=10, pady=8)
 
+        port_frame = ttk.LabelFrame(self.root, text="连接设置")
+        port_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(port_frame, text="串口:").pack(side="left", padx=(10, 4), pady=8)
+        self.port_combo = ttk.Combobox(
+            port_frame,
+            textvariable=self.port_var,
+            values=self.get_available_ports(),
+            width=12,
+        )
+        self.port_combo.pack(side="left", padx=(0, 8), pady=8)
+        ttk.Label(port_frame, text=f"波特率: {BAUD}").pack(side="left", padx=(0, 12), pady=8)
+        ttk.Button(port_frame, text="刷新端口", command=self.refresh_ports).pack(side="left", padx=(0, 8), pady=8)
+        ttk.Button(port_frame, text="连接/重连", command=self.connect_async).pack(side="left", pady=8)
+
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Label(status_frame, textvariable=self.status_var).pack(side="left", padx=(0, 18))
         ttk.Label(status_frame, textvariable=self.arm_var).pack(side="left", padx=(0, 18))
         ttk.Label(status_frame, textvariable=self.ack_var).pack(side="left")
-        ttk.Button(status_frame, text="重新连接", command=self.connect_async).pack(side="right")
 
         table = ttk.Frame(self.root)
         table.pack(fill="both", expand=True, padx=12, pady=8)
@@ -146,6 +166,23 @@ class ServoControlApp:
         ttk.Button(buttons, text="全部启用", command=lambda: self.set_all_enabled(True)).pack(side="left")
         ttk.Button(buttons, text="全部禁用", command=lambda: self.set_all_enabled(False)).pack(side="left", padx=8)
         ttk.Button(buttons, text="查看状态", command=self.refresh_status_text).pack(side="right")
+
+    def get_available_ports(self):
+        if list_ports is None:
+            return [self.port_var.get() or DEFAULT_PORT]
+
+        ports = [port.device for port in list_ports.comports()]
+        current = self.port_var.get() or DEFAULT_PORT
+        if current and current not in ports:
+            ports.insert(0, current)
+        return ports or [current]
+
+    def refresh_ports(self):
+        ports = self.get_available_ports()
+        self.port_combo.configure(values=ports)
+        if ports and not self.port_var.get():
+            self.port_var.set(ports[0])
+        self.status_var.set("端口列表已刷新")
 
     def add_servo_row(self, parent, index, config):
         enabled_var = tk.BooleanVar(value=config["enabled"])
@@ -197,39 +234,80 @@ class ServoControlApp:
         self.update_pwm_label(index)
 
     def connect_async(self):
-        if self.connected:
-            self.status_var.set(f"已连接: {PORT}, {BAUD}")
+        port = self.port_var.get().strip()
+        if not port:
+            messagebox.showwarning("缺少端口", "请选择或输入一个串口，例如 COM6。")
             return
 
-        self.status_var.set(f"正在连接: {PORT}, {BAUD}...")
-        thread = threading.Thread(target=self.connect_worker, daemon=True)
+        self.connection_id += 1
+        connection_id = self.connection_id
+        self.connected = False
+        self.latest_heartbeat = None
+        self.rc_arm_value = None
+        self.target_system = None
+        self.ack_var.set("命令回执: 无")
+
+        old_master = self.master
+        self.master = None
+        if old_master is not None:
+            try:
+                old_master.close()
+            except Exception:
+                pass
+
+        self.status_var.set(f"正在连接: {port}, {BAUD}...")
+        self.arm_var.set("解锁状态: 等待连接")
+        thread = threading.Thread(target=self.connect_worker, args=(port, connection_id), daemon=True)
         thread.start()
 
-    def connect_worker(self):
+    def connect_worker(self, port, connection_id):
         try:
             master = mavutil.mavlink_connection(
-                PORT,
+                port,
                 baud=BAUD,
                 source_system=255,
                 source_component=190,
                 autoreconnect=True,
                 force_connected=True,
             )
+            if connection_id != self.connection_id:
+                master.close()
+                return
+
             self.master = master
-            self.start_heartbeat_thread()
+            self.start_heartbeat_thread_once()
             msg = master.wait_heartbeat(timeout=HEARTBEAT_TIMEOUT_S)
             if msg is None:
                 raise TimeoutError("等待 PX4 heartbeat 超时")
+            if connection_id != self.connection_id:
+                master.close()
+                return
 
             self.target_system = master.target_system or msg.get_srcSystem()
             self.latest_heartbeat = msg
             self.connected = True
-            self.event_queue.put(("connected", f"已连接: system={self.target_system}, component={msg.get_srcComponent()}"))
-            self.start_receive_thread()
+            self.event_queue.put(
+                (
+                    "connected",
+                    f"已连接: {port}, system={self.target_system}, component={msg.get_srcComponent()}",
+                )
+            )
+            self.start_receive_thread(master, connection_id)
         except Exception as exc:
-            self.event_queue.put(("error", f"连接失败: {exc}"))
+            if connection_id == self.connection_id and self.master is not None:
+                try:
+                    self.master.close()
+                except Exception:
+                    pass
+                self.master = None
+                self.connected = False
+            self.event_queue.put(("error", f"连接失败: {port}: {exc}"))
 
-    def start_heartbeat_thread(self):
+    def start_heartbeat_thread_once(self):
+        if self.heartbeat_started:
+            return
+        self.heartbeat_started = True
+
         def worker():
             while not self.stop_event.is_set():
                 if self.master is not None:
@@ -248,12 +326,18 @@ class ServoControlApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def start_receive_thread(self):
+    def start_receive_thread(self, master, connection_id):
         def worker():
-            while not self.stop_event.is_set() and self.master is not None:
+            while (
+                not self.stop_event.is_set()
+                and connection_id == self.connection_id
+                and master is self.master
+            ):
                 try:
-                    msg = self.master.recv_match(blocking=True, timeout=0.2)
+                    msg = master.recv_match(blocking=True, timeout=0.2)
                 except Exception as exc:
+                    if connection_id != self.connection_id:
+                        break
                     self.event_queue.put(("error", f"接收 MAVLink 消息失败: {exc}"))
                     time.sleep(0.5)
                     continue
@@ -392,6 +476,11 @@ class ServoControlApp:
 
     def on_close(self):
         self.stop_event.set()
+        if self.master is not None:
+            try:
+                self.master.close()
+            except Exception:
+                pass
         self.root.destroy()
 
 
