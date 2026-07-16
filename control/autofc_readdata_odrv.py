@@ -9,11 +9,13 @@
 
 import odrive
 from odrive.enums import *
+from fibre.utils import Event
 import time
 import threading
 import os
 import csv
 import math
+import gc
 
 # --- 日志目录与文件 ---
 log_folder = "data/raw"
@@ -28,6 +30,49 @@ with open(filename, 'w', newline='') as f:
 
 # --- 回中周期（1 圈） ---
 RATIO = 1
+
+# ODrive 0.5.x 在发现设备后还会通过 USB 下载接口 JSON。设备或 USB
+# 通信异常时，这一步可能等待很久，因此每次连接都必须有明确的超时。
+ODRIVE_CONNECT_TIMEOUT = 30.0
+ODRIVE_RETRY_DELAY = 2.0
+
+
+def connect_odrive(timeout=ODRIVE_CONNECT_TIMEOUT, retry_delay=ODRIVE_RETRY_DELAY):
+    """限时寻找 ODrive；失败时关闭旧通道并自动重试。"""
+    attempt = 0
+
+    while True:
+        attempt += 1
+        channel_termination_token = Event()
+        print(f"正在寻找 ODrive 设备...（第 {attempt} 次，超时 {timeout:g} 秒）")
+
+        try:
+            device = odrive.find_any(
+                timeout=timeout,
+                channel_termination_token=channel_termination_token,
+            )
+        except KeyboardInterrupt:
+            channel_termination_token.set()
+            raise
+        except Exception as exc:
+            channel_termination_token.set()
+            print(f"[连接失败] {type(exc).__name__}: {exc}")
+        else:
+            if device is not None:
+                print("ODrive 已连接！")
+                return device, channel_termination_token
+
+            # find_any() 超时后仅停止搜索；显式终止它创建的 USB 通道，
+            # 防止下载 JSON 的后台线程继续占用设备。
+            channel_termination_token.set()
+            print(
+                f"[连接超时] {timeout:g} 秒内未完成连接。"
+                "请确认没有同时运行 odrivetool 或其他 ODrive 脚本。"
+            )
+
+        # 给 Fibre 接收线程一点退出时间，并促使 PyUSB 回收旧设备资源。
+        time.sleep(retry_delay)
+        gc.collect()
 
 # --- 帮助信息 ---
 HELP_TEXT = """
@@ -57,9 +102,7 @@ HELP_TEXT = """
 
 class ODriveMonitor:
     def __init__(self):
-        print("正在寻找 ODrive 设备...")
-        self.odrv = odrive.find_any()
-        print("ODrive 已连接！")
+        self.odrv, self._channel_termination_token = connect_odrive()
 
         self.axis = self.odrv.axis0
 
@@ -329,6 +372,8 @@ class ODriveMonitor:
     def stop(self):
         """安全退出"""
         self.running = False
+        if hasattr(self, '_channel_termination_token'):
+            self._channel_termination_token.set()
         if hasattr(self, 'f'):
             self.f.close()
 
